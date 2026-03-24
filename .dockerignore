@@ -1,0 +1,14 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+.env
+service_account.json
+receipts/
+temp/
+logs/
+*.db
+*.db-wal
+*.db-shm
+.venv
+venv

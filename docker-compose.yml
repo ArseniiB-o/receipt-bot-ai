@@ -1,0 +1,52 @@
+version: "3.9"
+
+services:
+  receipt_bot:
+    build: .
+    image: receipt-bot:latest
+    container_name: receipt_bot
+    restart: unless-stopped
+
+    # Inject secrets via env file — never bake them into the image
+    env_file:
+      - .env
+
+    # Override runtime paths to use named volumes
+    environment:
+      RECEIPTS_FOLDER: /data/receipts
+      TEMP_FOLDER: /data/temp
+      DB_PATH: /data/receipts.db
+
+    volumes:
+      - receipt_data:/data
+      - receipt_logs:/app/logs
+      # Inject service account at runtime (not baked into image)
+      # - /path/to/service_account.json:/run/secrets/service_account.json:ro
+      # Then set: GOOGLE_SERVICE_ACCOUNT_JSON=/run/secrets/service_account.json
+
+    # Resource limits — prevents runaway memory from large batch jobs
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import sqlite3; sqlite3.connect('/data/receipts.db').execute('SELECT 1')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  receipt_data:
+    driver: local
+  receipt_logs:
+    driver: local

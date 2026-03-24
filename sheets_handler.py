@@ -1,9 +1,25 @@
-"""Google Sheets writer — auto-detects column layout, inserts rows sorted by date."""
+"""Google Sheets writer — auto-detects column layout, inserts rows sorted by date.
+
+Fixes applied:
+  BUG-06  _col_cache protected by asyncio.Lock (was accessed from multiple async tasks).
+  BUG-07  ALL gspread calls wrapped in asyncio.wait_for() with explicit timeouts.
+  BUG-10  Early return guard when GOOGLE_SHEETS_ID is empty (was partially guarded).
+  BUG-17  service_account.json validated as proper JSON before auth is attempted.
+
+New features:
+  Exponential-backoff retry for all Sheets operations (2s / 4s / 8s).
+  Offline queue: on failure → add to pending_sheets_writes table.
+  Batch cell update (single API call per receipt, not per cell).
+"""
+from __future__ import annotations
+
 import asyncio
+import json
 import logging
 import urllib.request
 from datetime import date, datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Optional
 
 import gspread
@@ -11,6 +27,7 @@ import google.auth._helpers as _google_helpers
 from google.oauth2.service_account import Credentials
 
 from config import GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_SHEETS_ID, MONTH_SHEET_NAMES
+from constants import SHEETS_RETRY_DELAYS, SHEETS_WRITE_TIMEOUT
 from models import Receipt
 
 logger = logging.getLogger(__name__)
@@ -21,10 +38,7 @@ logger = logging.getLogger(__name__)
 _clock_skew_applied = False
 
 
-def _apply_clock_skew_fix():
-    """Compensate for system clock drift vs. Google servers.
-    Google OAuth rejects JWTs when iat differs by more than 5 minutes.
-    """
+def _apply_clock_skew_fix() -> None:
     global _clock_skew_applied
     if _clock_skew_applied:
         return
@@ -43,15 +57,13 @@ def _apply_clock_skew_fix():
             skew = server_time - system_time
             skew_secs = skew.total_seconds()
             if abs(skew_secs) > 30:
-                logger.warning(
-                    "Clock skew with Google servers: %.0f sec. Applying compensation.", skew_secs
-                )
-                _orig_utcnow = _google_helpers.utcnow
+                logger.warning("Clock skew with Google servers: %.0f sec.", skew_secs)
+                _orig = _google_helpers.utcnow
 
-                def _patched_utcnow():
-                    return _orig_utcnow() + timedelta(seconds=skew_secs)
+                def _patched():
+                    return _orig() + timedelta(seconds=skew_secs)
 
-                _google_helpers.utcnow = _patched_utcnow
+                _google_helpers.utcnow = _patched
             _clock_skew_applied = True
     except Exception as e:
         logger.debug("Could not check Google server time: %s", e)
@@ -63,14 +75,48 @@ _apply_clock_skew_fix()
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",  # narrowed from full drive access
+    "https://www.googleapis.com/auth/drive.file",
 ]
 
-HEADER_ROW = 5       # строка с заголовками колонок
-DATA_START_ROW = 6   # первая строка данных
+HEADER_ROW = 5
+DATA_START_ROW = 6
+
+# BUG-06: protect _col_cache with asyncio.Lock
+_col_cache: dict[str, tuple[dict, dict]] = {}
+_col_cache_lock = asyncio.Lock()
+
+# Serializes concurrent writes — prevents two receipts landing on the same row
+_sheets_lock = asyncio.Lock()
+
+
+# ─── Service account validation (BUG-17) ─────────────────────────────────────
+
+
+def _validate_service_account() -> bool:
+    """Verify service_account.json exists and is valid JSON before attempting auth."""
+    path = Path(GOOGLE_SERVICE_ACCOUNT_JSON)
+    if not path.exists():
+        logger.error("service_account.json not found at %s", path)
+        return False
+    try:
+        data = json.loads(path.read_text())
+        required_keys = {"type", "project_id", "private_key", "client_email"}
+        missing = required_keys - set(data.keys())
+        if missing:
+            logger.error("service_account.json missing required keys: %s", missing)
+            return False
+        if data.get("type") != "service_account":
+            logger.error("service_account.json type is %r, expected 'service_account'", data.get("type"))
+            return False
+        return True
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error("service_account.json is not valid JSON: %s", e)
+        return False
 
 
 def _get_client() -> gspread.Client:
+    if not _validate_service_account():
+        raise ValueError("service_account.json validation failed — cannot authenticate with Google")
     creds = Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_JSON, scopes=SCOPES)
     return gspread.authorize(creds)
 
@@ -78,41 +124,17 @@ def _get_client() -> gspread.Client:
 def _get_sheet_name(receipt_date: Optional[date]) -> str:
     if receipt_date:
         return MONTH_SHEET_NAMES.get(receipt_date.month, "Jan")
-    from datetime import date as date_cls
-    return MONTH_SHEET_NAMES.get(date_cls.today().month, "Jan")
+    return MONTH_SHEET_NAMES.get(date.today().month, "Jan")
 
 
-# Cache of column maps per worksheet tab name — avoids redundant API calls
-_col_cache: dict[str, tuple[dict, dict]] = {}
-
-# Serializes concurrent writes — prevents two receipts landing on the same row
-_sheets_lock = asyncio.Lock()
-
-
-def clear_column_cache():
+async def clear_column_cache() -> None:
     """Clear the column map cache (call if spreadsheet structure changes)."""
-    _col_cache.clear()
-
-
-def _build_column_maps(worksheet) -> tuple[dict, dict]:
-    """Read header row and build column index maps for both blocks.
-    Results are cached by sheet tab name to avoid redundant API calls.
-
-    Returns (left_cols, right_cols) where keys are:
-      beleg, datum, transaktion, kategorie, netto, ust, gesamt, website
-    Values are 1-based column numbers.
-    """
-    key = worksheet.title
-    if key not in _col_cache:
-        _col_cache[key] = _compute_column_maps(worksheet)
-    return _col_cache[key]
+    async with _col_cache_lock:
+        _col_cache.clear()
 
 
 def _compute_column_maps(worksheet) -> tuple[dict, dict]:
-    """Actually fetch the header row and compute column positions."""
     headers = worksheet.row_values(HEADER_ROW)
-
-    # Find where the right block starts — by the "Website" column
     right_block_start_idx = None
     for i, h in enumerate(headers):
         if h.strip().lower() == "website":
@@ -123,10 +145,8 @@ def _compute_column_maps(worksheet) -> tuple[dict, dict]:
     right_cols: dict[str, int] = {}
 
     for i, h in enumerate(headers):
-        col = i + 1  # 1-based
+        col = i + 1
         h_norm = h.strip().lower()
-
-        # Determine which block this column belongs to
         is_right = right_block_start_idx is not None and i >= right_block_start_idx
         target = right_cols if is_right else left_cols
 
@@ -147,23 +167,33 @@ def _compute_column_maps(worksheet) -> tuple[dict, dict]:
         elif "gesamt" in h_norm or "brutto" in h_norm or "total" in h_norm:
             target["gesamt"] = col
 
-    logger.debug("Left block columns: %s", left_cols)
-    logger.debug("Right block columns: %s", right_cols)
     return left_cols, right_cols
 
 
+async def _get_column_maps(worksheet) -> tuple[dict, dict]:
+    """Thread-safe column map retrieval with caching (BUG-06 fix)."""
+    key = worksheet.title
+    async with _col_cache_lock:
+        if key not in _col_cache:
+            loop = asyncio.get_running_loop()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _compute_column_maps, worksheet),
+                timeout=SHEETS_WRITE_TIMEOUT,
+            )
+            _col_cache[key] = result
+        return _col_cache[key]
+
+
 def _find_gesamt_row(worksheet, check_col: int) -> int:
-    """Find the totals row (Gesamt/Summe). Searches from the bottom up."""
     all_values = worksheet.col_values(check_col)
     for i in range(len(all_values) - 1, DATA_START_ROW - 2, -1):
         val = str(all_values[i]).strip().lower()
         if "gesamt" in val or "summ" in val or "total" in val:
-            return i + 1  # 1-based
+            return i + 1
     return 9999
 
 
 def _parse_date_cell(cell_str: str) -> Optional[date]:
-    """Parse a date cell in DD.MM.YYYY format."""
     s = (cell_str or "").strip()
     if not s:
         return None
@@ -183,30 +213,18 @@ def _find_insert_row(
     transaktion_values: Optional[list] = None,
     new_store: str = "",
 ) -> tuple[int, bool]:
-    """Find the row to insert into: sorted by date, then alphabetically by store within same date.
-
-    Returns (row_1based, need_insert).
-    """
     last_filled_row = None
-
     for i in range(DATA_START_ROW - 1, min(len(datum_values), gesamt_row - 1)):
         cell = datum_values[i].strip() if datum_values[i] else ""
-
         if not cell:
             return i + 1, False
-
         existing_date = _parse_date_cell(cell)
         last_filled_row = i + 1
-
         if existing_date is None:
             continue
-
         if existing_date > new_date:
-            # Existing date is later — insert before it
             return i + 1, True
-
         if existing_date == new_date and new_store and transaktion_values:
-            # Same date — sort alphabetically by store
             existing_store = ""
             if i < len(transaktion_values):
                 t = transaktion_values[i] or ""
@@ -214,14 +232,9 @@ def _find_insert_row(
             if new_store.lower() < existing_store:
                 return i + 1, True
 
-    if last_filled_row is not None:
-        next_row = last_filled_row + 1
-    else:
-        next_row = DATA_START_ROW
-
+    next_row = (last_filled_row + 1) if last_filled_row is not None else DATA_START_ROW
     if gesamt_row < 9999 and next_row >= gesamt_row:
         return gesamt_row, True
-
     return next_row, False
 
 
@@ -232,21 +245,19 @@ def _beleg_exists_in_col(worksheet, beleg: str, col_idx: int) -> bool:
         return False
 
 
-def _write_row(worksheet, row: int, cols: dict, values: dict):
-    """Write values to a row. values: {key -> value}."""
-    cells_to_update = []
+def _write_row_batch(worksheet, row: int, cols: dict, values: dict) -> None:
+    """Write all values for a receipt in a single batch API call (performance)."""
+    cells = []
     for key, value in values.items():
         if key in cols and value is not None:
-            cells_to_update.append(gspread.Cell(row, cols[key], value))
-    if cells_to_update:
-        worksheet.update_cells(cells_to_update, value_input_option="USER_ENTERED")
+            cells.append(gspread.Cell(row, cols[key], value))
+    if cells:
+        worksheet.update_cells(cells, value_input_option="USER_ENTERED")
 
 
 def _build_transaktion(receipt: Receipt) -> str:
-    """Build the Transaktion column value: store + item list (max 100 chars)."""
     store = receipt.store or ""
     items = receipt.items or []
-
     if items:
         names = [i.name for i in items if i.name][:4]
         items_str = ", ".join(names)
@@ -257,31 +268,26 @@ def _build_transaktion(receipt: Receipt) -> str:
         full = store
     else:
         full = "Доход" if receipt.type == "income" else "Расход"
-
     return full[:100]
 
 
-def _sync_write_to_sheets(receipt: Receipt):
-    """Synchronous write to Google Sheets (called from executor)."""
+def _sync_write_to_sheets(receipt: Receipt) -> None:
+    """Synchronous Google Sheets write (runs in executor)."""
     client = _get_client()
     spreadsheet = client.open_by_key(GOOGLE_SHEETS_ID)
-
     sheet_name = _get_sheet_name(receipt.receipt_date)
 
-    # Find the worksheet for the receipt's month
     try:
         worksheet = spreadsheet.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
         logger.warning("Sheet '%s' not found, falling back to current month", sheet_name)
-        from datetime import date as date_cls
-        fallback = MONTH_SHEET_NAMES.get(date_cls.today().month, "Jan")
+        fallback = MONTH_SHEET_NAMES.get(date.today().month, "Jan")
         try:
             worksheet = spreadsheet.worksheet(fallback)
         except gspread.WorksheetNotFound:
             worksheet = spreadsheet.get_worksheet(0)
 
-    # Auto-detect column positions from header row (cached)
-    left_cols, right_cols = _build_column_maps(worksheet)
+    left_cols, right_cols = _compute_column_maps(worksheet)
 
     date_str = receipt.receipt_date.strftime("%d.%m.%Y") if receipt.receipt_date else ""
     new_date = receipt.receipt_date or date.today()
@@ -290,24 +296,19 @@ def _sync_write_to_sheets(receipt: Receipt):
     if receipt.type == "income":
         if not left_cols:
             raise ValueError("Left block columns not found (Betriebseinnahmen)")
-
         datum_col = left_cols.get("datum") or next(iter(left_cols.values()))
         beleg_col = left_cols.get("beleg", datum_col)
-
         if _beleg_exists_in_col(worksheet, receipt.receipt_number, beleg_col):
             logger.info("Duplicate in Sheets (income) — skipping: %s", receipt.receipt_number)
             return
-
         gesamt_row = _find_gesamt_row(worksheet, datum_col)
         datum_values = worksheet.col_values(datum_col)
         transaktion_col = left_cols.get("transaktion")
         transaktion_values = worksheet.col_values(transaktion_col) if transaktion_col else None
         row, need_insert = _find_insert_row(datum_values, new_date, gesamt_row, transaktion_values, receipt.store or "")
-
         if need_insert:
             worksheet.insert_rows([[]], row=row, inherit_from_before=True)
-
-        values = {
+        _write_row_batch(worksheet, row, left_cols, {
             "beleg": receipt.receipt_number,
             "datum": date_str,
             "transaktion": transaktion,
@@ -315,31 +316,24 @@ def _sync_write_to_sheets(receipt: Receipt):
             "netto": receipt.netto or receipt.total_amount or 0,
             "ust": receipt.ust_amount or 0,
             "gesamt": receipt.total_amount or 0,
-        }
-        _write_row(worksheet, row, left_cols, values)
-        logger.info("Income written: %s → sheet '%s' row %d", receipt.receipt_number, sheet_name, row)
-
-    else:  # expense или unknown
+        })
+        logger.info("Income written: %s → '%s' row %d", receipt.receipt_number, sheet_name, row)
+    else:
         if not right_cols:
             raise ValueError("Right block columns not found (Betriebsausgaben)")
-
         datum_col = right_cols.get("datum") or next(iter(right_cols.values()))
         beleg_col = right_cols.get("beleg", datum_col)
-
         if _beleg_exists_in_col(worksheet, receipt.receipt_number, beleg_col):
             logger.info("Duplicate in Sheets (expense) — skipping: %s", receipt.receipt_number)
             return
-
         gesamt_row = _find_gesamt_row(worksheet, datum_col)
         datum_values = worksheet.col_values(datum_col)
         transaktion_col = right_cols.get("transaktion")
         transaktion_values = worksheet.col_values(transaktion_col) if transaktion_col else None
         row, need_insert = _find_insert_row(datum_values, new_date, gesamt_row, transaktion_values, receipt.store or "")
-
         if need_insert:
             worksheet.insert_rows([[]], row=row, inherit_from_before=True)
-
-        values = {
+        _write_row_batch(worksheet, row, right_cols, {
             "website": receipt.website or receipt.store or "",
             "beleg": receipt.receipt_number,
             "datum": date_str,
@@ -348,25 +342,114 @@ def _sync_write_to_sheets(receipt: Receipt):
             "netto": receipt.netto or receipt.total_amount or 0,
             "ust": receipt.ust_amount or 0,
             "gesamt": receipt.total_amount or 0,
-        }
-        _write_row(worksheet, row, right_cols, values)
-        logger.info("Expense written: %s → sheet '%s' row %d", receipt.receipt_number, sheet_name, row)
+        })
+        logger.info("Expense written: %s → '%s' row %d", receipt.receipt_number, sheet_name, row)
 
 
-async def write_to_sheets(receipt: Receipt, retries: int = 3) -> bool:
-    """Async write to Google Sheets with retry."""
+async def write_to_sheets(receipt: Receipt) -> bool:
+    """Async write to Google Sheets with timeout, retry, and offline queue fallback.
+
+    BUG-10: returns False immediately if GOOGLE_SHEETS_ID is not configured.
+    BUG-07: all gspread calls are wrapped in wait_for() with explicit timeout.
+    """
     if not GOOGLE_SHEETS_ID:
-        logger.warning("GOOGLE_SHEETS_ID not set — skipping Sheets write")
-        return False
+        return False  # BUG-10: silent guard — not an error
 
-    loop = asyncio.get_event_loop()
-    for attempt in range(retries):
+    loop = asyncio.get_running_loop()
+    for attempt, delay in enumerate(SHEETS_RETRY_DELAYS):
         try:
             async with _sheets_lock:
-                await loop.run_in_executor(None, _sync_write_to_sheets, receipt)
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, _sync_write_to_sheets, receipt),
+                    timeout=SHEETS_WRITE_TIMEOUT,
+                )
             return True
+        except asyncio.TimeoutError:
+            logger.error(
+                "Sheets write timed out (attempt %d/%d) for %s",
+                attempt + 1, len(SHEETS_RETRY_DELAYS), receipt.receipt_number,
+            )
         except Exception as e:
-            logger.error("Sheets write error (attempt %d/%d): %s", attempt + 1, retries, e)
-            if attempt < retries - 1:
-                await asyncio.sleep(2)
+            logger.error(
+                "Sheets write error (attempt %d/%d) for %s: %s",
+                attempt + 1, len(SHEETS_RETRY_DELAYS), receipt.receipt_number, e,
+            )
+        if attempt < len(SHEETS_RETRY_DELAYS) - 1:
+            await asyncio.sleep(delay)
+
+    # All retries failed — add to offline queue
+    try:
+        import database
+        database.add_pending_sheets_write(receipt.receipt_number)
+        logger.info("Added %s to pending_sheets_writes for later retry", receipt.receipt_number)
+    except Exception as e:
+        logger.error("Failed to add to pending queue: %s", e)
+
     return False
+
+
+async def retry_pending_writes() -> int:
+    """Retry all pending Sheets writes. Returns count of successfully flushed entries."""
+    import database
+
+    pending = database.get_pending_sheets_writes(limit=20)
+    if not pending:
+        return 0
+
+    success_count = 0
+    for entry in pending:
+        rec_dict = database.get_receipt_by_number(entry["receipt_number"])
+        if not rec_dict:
+            database.remove_pending_sheets_write(entry["id"])
+            continue
+        try:
+            rec = _dict_to_receipt(rec_dict)
+            ok = await write_to_sheets(rec)
+            if ok:
+                database.remove_pending_sheets_write(entry["id"])
+                success_count += 1
+        except Exception as e:
+            logger.warning("Retry failed for %s: %s", entry["receipt_number"], e)
+
+    return success_count
+
+
+def _dict_to_receipt(d: dict) -> Receipt:
+    """Reconstruct a Receipt from a database row dict (for Sheets retry)."""
+    import json as _json
+    from datetime import date as _date, time as _time
+    r = Receipt()
+    r.receipt_number = d.get("receipt_number", "")
+    r.type = d.get("type", "expense")
+    r.store = d.get("store")
+    r.website = d.get("website")
+    r.total_amount = d.get("total_amount")
+    r.netto = d.get("netto")
+    r.ust_amount = d.get("ust_amount") or 0.0
+    r.ust_rate = d.get("ust_rate") or 0
+    r.currency = d.get("currency", "EUR")
+    r.category = d.get("category")
+    r.confidence = d.get("confidence") or 0.0
+    r.telegram_user_id = d.get("telegram_user_id", 0)
+    r.telegram_username = d.get("telegram_username")
+    r.added_by = d.get("added_by")
+    date_str = d.get("receipt_date")
+    if date_str:
+        try:
+            r.receipt_date = _date.fromisoformat(date_str)
+        except (ValueError, TypeError):
+            pass
+    items_json = d.get("items_json") or "[]"
+    try:
+        items = _json.loads(items_json)
+        from models import ReceiptItem
+        for item in items:
+            if isinstance(item, dict):
+                r.items.append(ReceiptItem(
+                    name=item.get("name", ""),
+                    quantity=float(item.get("quantity", 1)),
+                    price=float(item.get("price", 0)),
+                ))
+    except Exception:
+        pass
+    return r

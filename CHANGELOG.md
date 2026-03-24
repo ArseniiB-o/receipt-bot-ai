@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.2.0] — 2026-03-23
+
+### Security
+
+- **`_is_allowed()` timing fix** — removed early `return True` inside the loop so all allowed IDs are always compared; execution time no longer reveals whether a user_id is in the allow-list
+- **`RE_PHONE` regex hardened** — added `(?<!\d)` / `(?!\d)` word-boundary anchors to prevent log scrubber from matching timestamps or IDs embedded in longer digit sequences
+- **Prompt injection protection** — added explicit instruction to both `AI_PROMPT` and `CHAT_PROMPT` to ignore any override instructions embedded in user-supplied data
+
+### Added
+
+- **Daily AI rate limit** (`RATE_AI_PER_DAY = 50`) — previously defined but not enforced; now applied per user per 24 hours before each AI call in `_process_one`
+- **`check_ai_rate_limit()`** helper in `utils.py` with 24-hour sliding window
+- **`ai_rate_limit` i18n key** in all three languages (RU / DE / EN)
+
+---
+
 ## [1.1.0] — 2026-03-19
 
 ### Added

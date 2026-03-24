@@ -1,8 +1,21 @@
-"""Inline keyboard callback handler — batch save/cancel/edit, language, history, stats."""
+"""Inline keyboard callback handler — batch save/cancel/edit, language, history, stats.
+
+Fixes applied:
+  BUG-05  Stale batch guard — every callback that fetches a batch checks for
+          expiry and responds gracefully if the session is gone.
+  BUG-09  User-selected model validated against AVAILABLE_MODEL_IDS before use.
+
+New features:
+  Privacy consent callback (privacy:accept).
+  Block/unblock user confirmation callbacks.
+"""
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 from datetime import datetime, date
+from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
@@ -10,15 +23,25 @@ from telegram.ext import ContextTypes
 import database
 import file_manager
 import sheets_handler
-from ai_processor import AVAILABLE_MODELS
+from ai_processor import AVAILABLE_MODELS, AVAILABLE_MODEL_IDS
+from constants import PRIVACY_NOTICE_VERSION
 from handlers.i18n import month_name, t
 from models import Receipt
-from utils import category_emoji, format_currency
-from handlers.message_handler import get_batch_key, refresh_batch_message
+from utils import category_emoji, format_currency, escape_html
+from handlers.message_handler import (
+    get_batch_key,
+    refresh_batch_message,
+    _build_batch_text_and_keyboard,
+    STATE_AWAITING,
+    STATE_SAVING,
+    STATE_IDLE,
+    _get_user_lock,
+    _get_user_state,
+    _reset_user_state,
+)
 
 logger = logging.getLogger(__name__)
 
-# Maps field name → i18n key for the label shown in the edit menu
 EDIT_FIELDS = {
     "type": "field_type",
     "store": "field_store",
@@ -34,35 +57,54 @@ def _batch_edit_menu_keyboard(batch_key: str, index: int, user_id: int) -> Inlin
     for field, label_key in EDIT_FIELDS.items():
         buttons.append([InlineKeyboardButton(
             t(user_id, label_key),
-            callback_data=f"batch_edit_field:{batch_key}:{index}:{field}"
+            callback_data=f"batch_edit_field:{batch_key}:{index}:{field}",
         )])
     buttons.append([InlineKeyboardButton(
         t(user_id, "back_to_list"),
-        callback_data=f"batch_back:{batch_key}"
+        callback_data=f"batch_back:{batch_key}",
     )])
     return InlineKeyboardMarkup(buttons)
+
+
+# ─── BUG-05: stale batch helper ───────────────────────────────────────────────
+
+
+async def _require_batch(
+    context: ContextTypes.DEFAULT_TYPE,
+    batch_key: str,
+    query,
+    user_id: int,
+) -> Optional[dict]:
+    """Return the batch dict, or respond to the user and return None if stale."""
+    batch = context.bot_data.get(batch_key)
+    if not batch:
+        try:
+            await query.edit_message_text(t(user_id, "session_expired"))
+        except Exception:
+            pass
+        return None
+    return batch
+
+
+# ─── Save one receipt ─────────────────────────────────────────────────────────
 
 
 async def _do_save_one(
     context: ContextTypes.DEFAULT_TYPE,
     receipt: Receipt,
-    temp_paths: list,
-) -> tuple:
-    """Save one receipt. Returns (ok: bool, receipt_number: str, sheets_ok: bool)."""
+    temp_paths: list[str],
+) -> tuple[bool, str, bool]:
+    """Save one receipt. Returns (ok, receipt_number, sheets_ok)."""
     now = receipt.receipt_date or date.today()
-
-    # Atomically assign receipt number and save to DB (prevents race condition)
     receipt.file_paths = []
     try:
         receipt_number, _ = database.save_receipt_atomic(receipt, now.year, now.month)
     except Exception as e:
-        logger.error("SQLite error: %s", e)
-        for tp in temp_paths:
-            file_manager.delete_temp_file(tp)
+        logger.error("SQLite error saving receipt: %s", e)
+        file_manager.cleanup_temp_paths(temp_paths)
         return False, receipt.receipt_number or "?", False
 
-    # Move files to permanent storage after number is assigned
-    saved_paths = []
+    saved_paths: list[str] = []
     for i, tp in enumerate(temp_paths):
         try:
             dest = await file_manager.save_receipt_file(
@@ -79,7 +121,6 @@ async def _do_save_one(
             logger.error("File save error: %s", e)
             file_manager.delete_temp_file(tp)
 
-    # Update file paths in DB if any were saved
     if saved_paths:
         receipt.file_paths = saved_paths
         try:
@@ -94,14 +135,17 @@ async def _do_save_one(
     except asyncio.TimeoutError:
         logger.error("Google Sheets write timed out for %s", receipt.receipt_number)
         sheets_ok = False
+
     return True, receipt_number, sheets_ok
 
 
-async def _batch_save_all(update, context, query, batch_key: str):
+# ─── Batch operations ─────────────────────────────────────────────────────────
+
+
+async def _batch_save_all(update, context, query, batch_key: str) -> None:
     user_id = update.effective_user.id
-    batch = context.bot_data.get(batch_key)
+    batch = await _require_batch(context, batch_key, query, user_id)
     if not batch:
-        await query.edit_message_text(t(user_id, "session_expired"))
         return
 
     receipts = batch["receipts"]
@@ -109,6 +153,12 @@ async def _batch_save_all(update, context, query, batch_key: str):
     all_temp_paths = batch["all_temp_paths"]
 
     await query.edit_message_text(t(user_id, "saving_all"))
+
+    # Update state machine
+    lock = _get_user_lock(context, user_id)
+    async with lock:
+        qs = _get_user_state(context, user_id)
+        qs.state = STATE_SAVING
 
     results = []
     for i, receipt in enumerate(receipts):
@@ -119,6 +169,10 @@ async def _batch_save_all(update, context, query, batch_key: str):
         results.append((ok, num, sheets_ok, i + 1))
 
     context.bot_data.pop(batch_key, None)
+
+    # Reset state machine to IDLE
+    async with lock:
+        _reset_user_state(context, user_id)
 
     lines = [t(user_id, "saved_header")]
     for ok, num, sheets_ok, idx in results:
@@ -133,39 +187,38 @@ async def _batch_save_all(update, context, query, batch_key: str):
     await query.edit_message_text("\n".join(lines), parse_mode="HTML")
 
 
-async def _batch_cancel_one(update, context, query, batch_key: str, index: int):
+async def _batch_cancel_one(update, context, query, batch_key: str, index: int) -> None:
     batch = context.bot_data.get(batch_key)
     if not batch:
         return
     batch["cancelled"].add(index)
-
-    # Clean up temp files for cancelled item
     paths = batch["all_temp_paths"][index] if index < len(batch["all_temp_paths"]) else []
-    for p in paths:
-        file_manager.delete_temp_file(p)
+    file_manager.cleanup_temp_paths(paths if isinstance(paths, list) else [paths])
 
     batch["_key"] = batch_key
-    from handlers.message_handler import _build_batch_text_and_keyboard
     text, keyboard = _build_batch_text_and_keyboard(batch)
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
-async def _batch_cancel_all(update, context, query, batch_key: str):
+async def _batch_cancel_all(update, context, query, batch_key: str) -> None:
     user_id = update.effective_user.id
     batch = context.bot_data.pop(batch_key, {})
     for paths in batch.get("all_temp_paths", []):
-        for p in paths:
-            file_manager.delete_temp_file(p)
+        file_manager.cleanup_temp_paths(paths if isinstance(paths, list) else [paths])
+
+    lock = _get_user_lock(context, user_id)
+    async with lock:
+        _reset_user_state(context, user_id)
+
     await query.edit_message_text(t(user_id, "all_cancelled"))
 
 
-async def _batch_show_edit_menu(update, context, query, batch_key: str, index: int):
+async def _batch_show_edit_menu(update, context, query, batch_key: str, index: int) -> None:
     user_id = update.effective_user.id
-    batch = context.bot_data.get(batch_key)
+    batch = await _require_batch(context, batch_key, query, user_id)
     if not batch:
-        await query.edit_message_text(t(user_id, "session_expired_short"))
         return
-    receipt = batch["receipts"][index]
+    receipt: Optional[Receipt] = batch["receipts"][index] if index < len(batch["receipts"]) else None
     if receipt is None:
         return
     text = (
@@ -179,13 +232,14 @@ async def _batch_show_edit_menu(update, context, query, batch_key: str, index: i
     )
 
 
-async def _batch_select_edit_field(update, context, query, batch_key: str, index: int, field: str):
+async def _batch_select_edit_field(
+    update, context, query, batch_key: str, index: int, field: str
+) -> None:
     user_id = update.effective_user.id
-    batch = context.bot_data.get(batch_key)
+    batch = await _require_batch(context, batch_key, query, user_id)
     if not batch:
-        await query.edit_message_text(t(user_id, "session_expired_short"))
         return
-    receipt = batch["receipts"][index]
+    receipt: Optional[Receipt] = batch["receipts"][index] if index < len(batch["receipts"]) else None
     current_val = getattr(receipt, field, "—") if receipt else "—"
     label = t(user_id, EDIT_FIELDS.get(field, field))
 
@@ -202,23 +256,31 @@ async def _batch_select_edit_field(update, context, query, batch_key: str, index
     )
 
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ─── Main callback dispatcher ─────────────────────────────────────────────────
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
     data = query.data or ""
-    user = update.effective_user
-    user_id = user.id
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
-    # ── Model selection ───────────────────────────────────────────────────────
+    # ── Privacy consent ───────────────────────────────────────────────────────
+    if data == "privacy:accept":
+        database.set_privacy_accepted(user_id, PRIVACY_NOTICE_VERSION)
+        await query.edit_message_text(t(user_id, "privacy_accepted"))
+        await context.bot.send_message(chat_id=chat_id, text=t(user_id, "privacy_accepted_resend"))
+        return
+
+    # ── Model selection (BUG-09: validate against AVAILABLE_MODEL_IDS) ────────
     if data.startswith("model:"):
         model_value = data[6:]
-        valid_ids = {m[0] for m in AVAILABLE_MODELS}
         if model_value == "auto":
             database.set_user_model(user_id, None)
             display = t(user_id, "model_auto")
-        elif model_value in valid_ids:
+        elif model_value in AVAILABLE_MODEL_IDS:
             database.set_user_model(user_id, model_value)
             display = next(name for mid, name in AVAILABLE_MODELS if mid == model_value)
         else:
@@ -245,9 +307,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("batch_cancel:") and not data.startswith("batch_cancel_all:"):
         rest = data[len("batch_cancel:"):]
         parts = rest.rsplit(":", 1)
-        batch_key = parts[0]
-        index = int(parts[1])
-        await _batch_cancel_one(update, context, query, batch_key, index)
+        if len(parts) == 2:
+            batch_key, index_str = parts[0], parts[1]
+            try:
+                await _batch_cancel_one(update, context, query, batch_key, int(index_str))
+            except (ValueError, IndexError):
+                pass
 
     # ── Batch: cancel all ─────────────────────────────────────────────────────
     elif data.startswith("batch_cancel_all:"):
@@ -258,20 +323,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("batch_edit_field:"):
         rest = data[len("batch_edit_field:"):]
         parts = rest.rsplit(":", 2)
-        batch_key = parts[0]
-        index = int(parts[1])
-        field = parts[2]
-        if field not in EDIT_FIELDS:
-            await query.answer(t(user_id, "invalid_field"), show_alert=True)
-            return
-        await _batch_select_edit_field(update, context, query, batch_key, index, field)
+        if len(parts) == 3:
+            batch_key, index_str, field = parts[0], parts[1], parts[2]
+            if field not in EDIT_FIELDS:
+                await query.answer(t(user_id, "invalid_field"), show_alert=True)
+                return
+            try:
+                await _batch_select_edit_field(update, context, query, batch_key, int(index_str), field)
+            except ValueError:
+                pass
 
     elif data.startswith("batch_edit:"):
         rest = data[len("batch_edit:"):]
         parts = rest.rsplit(":", 1)
-        batch_key = parts[0]
-        index = int(parts[1])
-        await _batch_show_edit_menu(update, context, query, batch_key, index)
+        if len(parts) == 2:
+            batch_key, index_str = parts[0], parts[1]
+            try:
+                await _batch_show_edit_menu(update, context, query, batch_key, int(index_str))
+            except ValueError:
+                pass
 
     # ── Batch: back to list ───────────────────────────────────────────────────
     elif data.startswith("batch_back:"):
@@ -281,7 +351,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(t(user_id, "session_expired_short"))
             return
         batch["_key"] = batch_key
-        from handlers.message_handler import _build_batch_text_and_keyboard
         text, keyboard = _build_batch_text_and_keyboard(batch)
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -310,8 +379,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split(":")
         filter_type = parts[1] if len(parts) > 1 else "all"
         limit = int(parts[2]) if len(parts) > 2 else 10
+        offset = int(parts[3]) if len(parts) > 3 else 0
         uid = user_id if filter_type == "mine" else None
-        records = database.get_last_receipts(limit=limit, user_id=uid)
+        records = database.get_last_receipts(limit=limit, user_id=uid, offset=offset)
 
         if not records:
             await query.edit_message_text(t(user_id, "no_records"))
@@ -324,17 +394,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if date_str and len(date_str) == 10:
                 date_str = date_str[8:10] + "." + date_str[5:7]
             amount = format_currency(r["total_amount"], r.get("currency", "EUR"))
-            store = r["store"] or "—"
-            added = r["added_by"] or r["telegram_username"] or "—"
-            lines.append(
-                f"{i}. #{r['receipt_number']} | {date_str} | {type_icon} {store} | {amount} | 👤 {added}"
-            )
+            store = escape_html(r["store"] or "—")
+            lines.append(f"{i}. #{r['receipt_number']} | {date_str} | {type_icon} {store} | {amount}")
 
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton(t(user_id, "filter_all"), callback_data="history:all:10"),
-            InlineKeyboardButton(t(user_id, "filter_mine"), callback_data="history:mine:10"),
-        ]])
-        await query.edit_message_text("\n".join(lines), reply_markup=keyboard)
+        keyboard_rows = [[
+            InlineKeyboardButton(t(user_id, "filter_all"), callback_data=f"history:all:{limit}:{offset}"),
+            InlineKeyboardButton(t(user_id, "filter_mine"), callback_data=f"history:mine:{limit}:{offset}"),
+        ]]
+        if offset > 0:
+            keyboard_rows.append([
+                InlineKeyboardButton("← Prev", callback_data=f"history:{filter_type}:{limit}:{max(0, offset-limit)}")
+            ])
+        if len(records) == limit:
+            keyboard_rows.append([
+                InlineKeyboardButton("Next →", callback_data=f"history:{filter_type}:{limit}:{offset+limit}")
+            ])
+
+        await query.edit_message_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            parse_mode="HTML",
+        )
 
     # ── Stats filter ──────────────────────────────────────────────────────────
     elif data.startswith("stats:"):
@@ -371,20 +451,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("\n".join(lines), reply_markup=keyboard)
 
 
-async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text input when user is editing a field of a receipt in a batch."""
-    edit_state = context.user_data.get("edit_state")
-    if not edit_state:
-        return
+# ─── Edit input handler ───────────────────────────────────────────────────────
 
-    if edit_state.get("mode") != "batch":
+
+async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text input when user is editing a receipt field."""
+    edit_state = context.user_data.get("edit_state")
+    if not edit_state or edit_state.get("mode") != "batch":
         return
 
     user_id = update.effective_user.id
     batch_key = edit_state["batch_key"]
     index = edit_state["index"]
     field = edit_state["field"]
-    new_value = update.message.text or ""
+    new_value = (update.message.text or "").strip()
 
     if field not in EDIT_FIELDS:
         context.user_data.pop("edit_state", None)
@@ -396,7 +476,7 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("edit_state", None)
         return
 
-    receipt: Receipt = batch["receipts"][index]
+    receipt: Optional[Receipt] = batch["receipts"][index] if index < len(batch["receipts"]) else None
     if not receipt:
         context.user_data.pop("edit_state", None)
         return
@@ -404,23 +484,36 @@ async def handle_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if field == "total_amount":
             val = float(new_value.replace(",", ".").replace(" ", ""))
+            if val < 0:
+                raise ValueError("Amount cannot be negative")
             receipt.total_amount = val
             if receipt.netto is None:
                 receipt.netto = val
         elif field == "receipt_date":
-            parts = new_value.strip().split(".")
+            from constants import DATE_MIN_YEAR, DATE_MAX_YEAR
+            parts = new_value.split(".")
             if len(parts) == 3:
-                receipt.receipt_date = date(int(parts[2]), int(parts[1]), int(parts[0]))
+                parsed_date = date(int(parts[2]), int(parts[1]), int(parts[0]))
+                if not (DATE_MIN_YEAR <= parsed_date.year <= DATE_MAX_YEAR):
+                    raise ValueError(f"Year must be between {DATE_MIN_YEAR} and {DATE_MAX_YEAR}")
+                receipt.receipt_date = parsed_date
             else:
                 raise ValueError(t(user_id, "date_format_hint"))
         elif field == "type":
-            v = new_value.strip().lower()
+            v = new_value.lower()
             if v in ("expense", "income"):
                 receipt.type = v
             else:
                 raise ValueError(t(user_id, "type_format_hint"))
+        elif field == "category":
+            from ai_processor import _VALID_CATEGORIES
+            if new_value in _VALID_CATEGORIES:
+                receipt.category = new_value
+            else:
+                valid = ", ".join(sorted(_VALID_CATEGORIES))
+                raise ValueError(f"Valid categories: {valid}")
         else:
-            setattr(receipt, field, new_value.strip())
+            setattr(receipt, field, new_value[:500])
 
         context.user_data.pop("edit_state", None)
         await update.message.reply_text(t(user_id, "updated"))

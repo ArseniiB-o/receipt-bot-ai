@@ -1,7 +1,11 @@
-"""Domain models — Receipt and ReceiptItem dataclasses with formatting helpers."""
+"""Domain models — Receipt and ReceiptItem dataclasses with validation."""
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Optional
 from datetime import date, time, datetime
+from typing import Optional
+
+from constants import DATE_MIN_YEAR, DATE_MAX_YEAR
 
 
 @dataclass
@@ -10,38 +14,56 @@ class ReceiptItem:
     quantity: float = 1.0
     price: float = 0.0
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str):
+            self.name = str(self.name)
+        self.name = self.name[:200]
+        # Guard against non-numeric values from AI
+        try:
+            self.quantity = float(self.quantity)
+            if self.quantity <= 0:
+                self.quantity = 1.0
+        except (TypeError, ValueError):
+            self.quantity = 1.0
+        try:
+            self.price = float(self.price)
+            if self.price < 0:
+                self.price = 0.0
+        except (TypeError, ValueError):
+            self.price = 0.0
+
 
 @dataclass
 class Receipt:
-    # Идентификация
+    # Identity
     receipt_number: str = ""
     type: str = "expense"           # 'expense' | 'income' | 'unknown'
 
-    # Магазин / источник
+    # Store / source
     store: Optional[str] = None
     website: Optional[str] = None
 
-    # Суммы
+    # Amounts
     total_amount: Optional[float] = None
     netto: Optional[float] = None
     ust_amount: Optional[float] = None
     ust_rate: Optional[float] = None
     currency: str = "EUR"
 
-    # Дата и время
+    # Date and time
     receipt_date: Optional[date] = None
     receipt_time: Optional[time] = None
 
-    # Категория и позиции
+    # Category and items
     category: Optional[str] = None
     items: list[ReceiptItem] = field(default_factory=list)
 
-    # Метаданные AI
-    confidence: float = 0.0
+    # AI metadata
+    confidence: float = 0.5
     notes: Optional[str] = None
     raw_ai_response: Optional[str] = None
 
-    # Файлы
+    # Files
     file_paths: list[str] = field(default_factory=list)
 
     # Telegram
@@ -50,9 +72,38 @@ class Receipt:
     telegram_username: Optional[str] = None
     added_by: Optional[str] = None
 
-    # Статус
+    # Status
     status: str = "confirmed"       # 'confirmed' | 'needs_review'
     created_at: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        # Clamp confidence
+        try:
+            self.confidence = min(1.0, max(0.0, float(self.confidence)))
+        except (TypeError, ValueError):
+            self.confidence = 0.5
+
+        # Validate type
+        if self.type not in ("expense", "income", "unknown"):
+            self.type = "unknown"
+
+        # Validate currency
+        if not self.currency or not isinstance(self.currency, str):
+            self.currency = "EUR"
+        self.currency = self.currency[:10]
+
+        # Validate date range
+        if self.receipt_date is not None:
+            if not (DATE_MIN_YEAR <= self.receipt_date.year <= DATE_MAX_YEAR):
+                self.receipt_date = date.today()
+
+        # Clamp amounts to non-negative
+        if self.total_amount is not None and self.total_amount < 0:
+            self.total_amount = abs(self.total_amount)
+        if self.netto is not None and self.netto < 0:
+            self.netto = abs(self.netto)
+        if self.ust_amount is not None and self.ust_amount < 0:
+            self.ust_amount = 0.0
 
     def display_type(self) -> str:
         if self.type == "expense":
@@ -91,7 +142,7 @@ class Receipt:
             lines.append(f"👤 Добавил: {self.added_by}")
         if self.receipt_number:
             lines.append(f"\n🔢 Номер чека: {self.receipt_number}")
-        if self.confidence < 0.5:
-            lines.append("\n⚠️ Низкая уверенность — требует проверки")
+        if self.confidence < 0.6:
+            lines.append("\n⚠️ Низкая уверенность — рекомендуется проверка")
 
         return "\n".join(lines)
