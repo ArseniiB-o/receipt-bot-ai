@@ -1,0 +1,8 @@
+{
+  "hooks": {
+    "PostToolUse": ".claude/hooks/post-tool-use.sh",
+    "PreSessionStart": ".claude/hooks/session-start.sh",
+    "PostSessionEnd": ".claude/hooks/session-end.sh",
+    "Notification": ".claude/hooks/notification.sh"
+  }
+}
